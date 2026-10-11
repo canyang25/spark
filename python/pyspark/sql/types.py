@@ -487,8 +487,9 @@ class TimeType(AnyTimeType):
 def _naive_dt_to_epoch_seconds(dt: datetime.datetime) -> int:
     """Convert a naive local datetime to whole POSIX seconds, honoring ``fold``.
 
-    Shared by :meth:`TimestampType.toInternal` and :meth:`TimestampLTZNanosType.toInternal`
-    so both local-time types agree on the repeated DST hour (SPARK-60081).
+    Shared by :meth:`TimestampType.toInternal`, :meth:`TimestampLTZNanosType.toInternal`,
+    and the classic Py4J ``DatetimeConverter`` so createDataFrame, Connect ``lit()``, and
+    classic ``lit()`` agree on the repeated DST hour (SPARK-60081).
 
     ``datetime.datetime.timestamp(dt.replace(microsecond=0))`` is used instead of
     ``time.mktime(dt.timetuple())`` so the result honors ``datetime.fold``. The unbound
@@ -498,14 +499,16 @@ def _naive_dt_to_epoch_seconds(dt: datetime.datetime) -> int:
     so the caller can add ``dt.microsecond`` back without the double-counting that plain
     ``int(dt.timestamp())`` produces for pre-1970 and far-future values.
 
-    Naive ``datetime.min.timestamp()`` raises ``ValueError`` ("year 0 is out of range");
-    fall back to ``time.mktime`` so ``toInternal`` keeps the previous value for these
-    range-edge inputs. ``datetime.min`` does not round-trip through ``fromInternal``.
+    Naive ``datetime.min.timestamp()`` raises ``ValueError`` ("year 0 is out of range").
+    On Windows, naive ``timestamp()`` within about a day after the epoch can raise
+    ``OSError`` because the fold probe calls ``localtime`` on a negative ``time_t``.
+    Fall back to ``time.mktime`` so callers keep the previous value for these range-edge
+    inputs. ``datetime.min`` does not round-trip through ``fromInternal``.
     """
     try:
         # Unbound stdlib method: a bound call would dispatch to pandas.Timestamp.timestamp.
         seconds = datetime.datetime.timestamp(dt.replace(microsecond=0))
-    except (OverflowError, ValueError):
+    except (OverflowError, ValueError, OSError):
         seconds = time.mktime(dt.timetuple())
     return int(seconds)
 
@@ -4133,7 +4136,7 @@ class DatetimeConverter:
 
         Timestamp = JavaClass("java.sql.Timestamp", gateway_client)
         seconds = (
-            calendar.timegm(obj.utctimetuple()) if obj.tzinfo else time.mktime(obj.timetuple())
+            calendar.timegm(obj.utctimetuple()) if obj.tzinfo else _naive_dt_to_epoch_seconds(obj)
         )
         t = Timestamp(int(seconds) * 1000)
         t.setNanos(obj.microsecond * 1000)

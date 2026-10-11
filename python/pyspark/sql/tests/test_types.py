@@ -3615,6 +3615,27 @@ class TypesTestsMixin:
         with self.assertRaises(PySparkNotImplementedError):
             self.spark.sql("SELECT make_interval(100, 11, 1, 1, 12, 30, 01.001001)").first()[0]
 
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires time.tzset()")
+    def test_lit_equals_create_dataframe_dst_fold(self):
+        # SPARK-60081: classic F.lit / Column comparisons go through DatetimeConverter on the
+        # driver, while createDataFrame goes through toInternal. Both must honor fold so an
+        # equality filter of a createDataFrame column against the same Python datetime matches.
+        # Driver TZ is enough: both conversions run in this process. Connect lit() already uses
+        # toInternal, so this is also the Connect lit() vs createDataFrame agreement check.
+        with DataTypeTests._tz("America/Los_Angeles"):
+            for fold in (0, 1):
+                dt = datetime.datetime(2021, 11, 7, 1, 30, fold=fold)
+                df = self.spark.createDataFrame([(dt,)], "t timestamp")
+                self.assertEqual(1, df.filter(F.col("t") == dt).count())
+                self.assertEqual(1, df.filter(F.col("t") == F.lit(dt)).count())
+            # Aware and non-ambiguous naive values must still match as before this change.
+            naive = datetime.datetime(2021, 1, 1, 12, 0)
+            df = self.spark.createDataFrame([(naive,)], "t timestamp")
+            self.assertEqual(1, df.filter(F.col("t") == naive).count())
+            aware = datetime.datetime(2021, 1, 1, 20, 0, tzinfo=datetime.timezone.utc)
+            df = self.spark.createDataFrame([(aware,)], "t timestamp")
+            self.assertEqual(1, df.filter(F.col("t") == aware).count())
+
 
 class DataTypeTests(unittest.TestCase, PySparkErrorTestUtils):
     def test_from_json_does_not_mutate_collation_metadata(self):
@@ -4072,6 +4093,49 @@ class DataTypeTests(unittest.TestCase, PySparkErrorTestUtils):
                         self.assertEqual(expected, out)
                         self.assertIsNone(out.tzinfo)
                         self.assertEqual(aware.microsecond, out.microsecond)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires time.tzset()")
+    def test_datetime_converter_preserves_dst_fold(self):
+        # Classic F.lit() / Column comparisons send naive datetimes through DatetimeConverter.
+        # That path must honor fold the same way toInternal does, and keep aware / non-ambiguous
+        # naive values on the previous timegm / mktime instants.
+        import calendar
+        from unittest.mock import patch
+
+        from pyspark.sql.types import DatetimeConverter
+
+        captured = {}
+
+        def fake_java_class(name, gateway_client):
+            self.assertEqual("java.sql.Timestamp", name)
+
+            class FakeTimestamp:
+                def __init__(self, ms):
+                    captured["ms"] = ms
+
+                def setNanos(self, n):
+                    captured["nanos"] = n
+
+            return FakeTimestamp
+
+        conv = DatetimeConverter()
+        with (
+            self._tz("America/Los_Angeles"),
+            patch("py4j.java_gateway.JavaClass", side_effect=fake_java_class),
+        ):
+            conv.convert(datetime.datetime(2021, 11, 7, 1, 30, fold=1), None)
+            self.assertEqual(1636277400 * 1000, captured["ms"])
+            conv.convert(datetime.datetime(2021, 11, 7, 1, 30, fold=0), None)
+            self.assertEqual(1636273800 * 1000, captured["ms"])
+
+            naive = datetime.datetime(2021, 1, 1, 12, 0, 0, 123456)
+            conv.convert(naive, None)
+            self.assertEqual(int(time.mktime(naive.timetuple())) * 1000, captured["ms"])
+            self.assertEqual(123456 * 1000, captured["nanos"])
+
+            aware = datetime.datetime(2021, 1, 1, 20, 0, tzinfo=datetime.timezone.utc)
+            conv.convert(aware, None)
+            self.assertEqual(calendar.timegm(aware.utctimetuple()) * 1000, captured["ms"])
 
 
 class DataTypeVerificationTests(unittest.TestCase, PySparkErrorTestUtils):

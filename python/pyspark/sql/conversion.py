@@ -1432,7 +1432,7 @@ class ArrowTableToRowsConversion:
                         value = value.to_pydatetime(warn=False)
                     # SPARK-60081: integer POSIX seconds so fromtimestamp sets fold on the
                     # local wall time, then re-attach microseconds. A float timestamp would
-                    # drop microseconds past ~2255 and can overflow at 9999-12-31 under UTC.
+                    # drop microseconds past ~2242 and can overflow at 9999-12-31 under UTC.
                     # fromtimestamp probes the offset one day earlier and raises ValueError
                     # ("year 0 is out of range") for instants in roughly the first day of
                     # year 1 (longer in zones west of UTC). Fall back to the previous
